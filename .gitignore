@@ -1,0 +1,27 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.DS_Store
+.idea/
+.vscode/
+.venv/
+venv/
+.env
+*id_rsa*
+*id_ed25519*
+*.pem
+
+# Never commit raw FHI-aims real-space matrices or converted DeepH HDF5 datasets
+*.h5
+*.hdf5
+*.scfout
+*.cube
+*.out
+*.bin
+realspace_soc_matrix*
+rs_soc_matrix*
+*.tar
+*.tar.gz
+*.tgz
+*.tar.zst
+*.zip

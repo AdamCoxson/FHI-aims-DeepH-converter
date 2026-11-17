@@ -1,11 +1,15 @@
-# FHI-aims to DeepH converter
-Python scripts for use with FHI-aims output to convert real space Hamiltonians into DeepH compatible format for ML-Hamiltonian training
+# FHI-aims → DeepH converter
 
 Convert real-space matrices from a periodic, nonmagnetic FHI-aims calculation
 with spin–orbit coupling (SOC) into the atom-pair HDF5 format used by DeepH-dock.
 The conversion produces a complex spinor Hamiltonian, a scalar baseline,
 overlap matrices, and structure/basis metadata for downstream ML Hamiltonian
 workflows.
+
+This is a standalone post-processing repository. To convert existing FHI-aims
+output files, you only need this repo, Python, and the packages installed below.
+Generating those input files requires a compatible FHI-aims build with real space SOC Hamiltonian export options, as described
+in [Prepare the FHI-aims calculation](#2-prepare-the-fhi-aims-calculation).
 
 This repository contains two tools:
 
@@ -31,9 +35,9 @@ python -m pip install numpy h5py ase "deepx-dock==0.9.11"
 
 DeepH-dock is installed as `deepx-dock` and imported as `deepx_dock`. Its
 [installation guide](https://docs.deeph-pack.com/deeph-dock/en/latest/installation_and_setup.html)
-covers other installation methods. Version `0.9.11` is the version checked
-with this converter; the scripts import internal DeepH-dock modules, so newer
-versions may need compatibility checks.
+covers other installation methods. The command above installs version `0.9.11`,
+which was checked with this converter. The required DeepH-dock functions are
+included in that package; no separate DeepH-dock source checkout is needed.
 
 Check that the runner and its imports work:
 
@@ -42,18 +46,17 @@ python fhi_to_deepH/run_aims_soc_to_deeph.py --help
 python -c "import sys; sys.path.insert(0, 'fhi_to_deepH'); from aims_soc_to_deeph import FHIAimsReader; print('Imports OK')"
 ```
 
-Run the scripts directly from the clone; there is no package installation step
-for this repository. The array-only helper requires just NumPy.
-
 ## 2. Prepare the FHI-aims calculation
 
 You need an FHI-aims build that exports the raw real-space SOC components as
-`realspace_soc_matrix.out`, alongside the scalar Hamiltonian and overlap.
+`rs_soc_matrix.out`, alongside the scalar Hamiltonian and overlap.
 The converter was validated with legacy raw exports from a modified FHI-aims
-revision, `f68eead427b68dbf1828261d9872383a523f9ac4`. The FHI-aims source
-modifications and executable are **not included in this repository**.
+revision, `f68eead427b68dbf1828261d9872383a523f9ac4`.
 
-For a compatible build, include these settings in `control.in`, in addition
+The FHI-aims source
+modifications and executable are **not included in this repository**. It is in the process of being added to FHI-aims, so please get in touch if you want the functionality early.
+
+Include these settings in `control.in`, in addition
 to your normal calculation settings and species definitions:
 
 ```text
@@ -62,15 +65,7 @@ output_rs_matrices plain
 output rs_soc_matrix plain
 ```
 
-The legacy SOC exporter requires global matrix storage; its compatible setup
-uses `use_local_index .false.` and `load_balancing .false.`. Other restrictions
-on real-space matrix export depend on your FHI-aims build. If
-`output rs_soc_matrix plain` is unrecognized, obtain a build with that exporter
-before using this conversion route.
-
-Run the calculation and retain its standard output as `aims.out`. All eight
-files below must come from the **same calculation**, with matching geometry,
-basis and sparse matrix indexing:
+After running the calculation, you will have the standard output files including the new rs_soc_matrix.out:
 
 ```text
 my_calculation/
@@ -81,13 +76,12 @@ my_calculation/
 ├── rs_indices.out
 ├── rs_hamiltonian.out
 ├── rs_overlap.out
-└── realspace_soc_matrix.out
+└── rs_soc_matrix.out
 ```
 
-`realspace_soc_matrix.out` contains three columns, the x, y and z SOC
-components in Hartree, in the packed order described by `rs_indices.out`.
+`rs_soc_matrix.out` contains three columns, which are the x, y and z SOC Pauli matrices in Hartree, in the packed order described by `rs_indices.out`.
 The parser accepts an optional first-line header containing the packed length
-and `3`. A binary SOC export is not an input to this runner.
+and `3`. Note, that a binary SOC export is not an input to this runner. We currently do not have support for rs_soc_matrix.bin (because I'm lazy).
 
 The command-line runner supports **periodic, nonmagnetic SOC calculations
 with plain-text matrix output**. Do not use `spin collinear` for this route.
@@ -95,6 +89,8 @@ Molecules without periodic lattice vectors, magnetic SOC calculations, and
 HDF5 input matrices are outside the runner's supported scope.
 
 ### Legacy SOC convention
+
+As of Oct 2026, the FHI-aims team are working on a fix to address antisymmetry errors in the SOC matrices. These converters have functionality to correct this legacy problem.
 
 The bundled parser always applies a historical sign correction to explicitly
 stored SOC entries for the same global orbital at nonzero lattice translation.
@@ -117,8 +113,9 @@ python fhi_to_deepH/run_aims_soc_to_deeph.py \
     /path/to/converted_calculation
 ```
 
-Replace both paths with your own. The output directory must **not already
-exist**; the runner creates it and any missing parents. It copies the eight
+Replace both paths with your own. The runner creates the output directory and
+any missing parents if needed. If the directory already exists, it overwrites
+the generated output files and keeps unrelated files. It copies the eight
 input files to a temporary directory before parsing, so automatic basis-index
 repairs leave your original calculation files unchanged.
 
@@ -129,7 +126,7 @@ The optional consistency tolerance defaults to `1e-3` eV:
 ```bash
 python fhi_to_deepH/run_aims_soc_to_deeph.py \
     /path/to/my_calculation \
-    /path/to/another_new_output \
+    /path/to/converted_calculation \
     --tolerance 1e-3
 ```
 
@@ -267,7 +264,7 @@ parsing, the exported HDF5 files, or agreement with FHI-aims eigenvalues.
 | Problem | What to check |
 | --- | --- |
 | `ModuleNotFoundError` | Activate the environment and install the dependencies with that environment's `python -m pip`. Check the `deepx_dock` spelling and version. |
-| `Choose a new output directory` | Select a destination that does not exist yet. |
+| `NotADirectoryError` for the output path | The output path points to a file. Choose a directory path instead. |
 | Missing input file | Collect all eight required files. Rename the calculation's standard-output log to `aims.out` if needed. |
 | Missing or unsupported `output_rs_matrices` | Use a compatible calculation with `output_rs_matrices plain` in `control.in`. |
 | `Only periodic system is supported!` | Supply a periodic geometry with lattice vectors. |
@@ -277,4 +274,3 @@ parsing, the exported HDF5 files, or agreement with FHI-aims eigenvalues.
 ## License
 
 [MIT](LICENSE).
-

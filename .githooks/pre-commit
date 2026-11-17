@@ -1,0 +1,163 @@
+#!/usr/bin/env python3
+"""
+Universal Git Pre-Commit Guardrail (Project 07 — AdamCoxson Repositories)
+Enforces:
+  1. Hard block on proprietary FHI-aims remotes (aims-git.rz-berlin.mpg.de) and blocked paths.
+  2. Hard <25 MB cap on every staged Git blob (warns at >=10 MB).
+  3. Block on scientific binary / checkpoint / archive / key globs.
+  4. Secret token & proprietary FHI-aims Fortran source header scan on staged diffs.
+"""
+
+from __future__ import annotations
+
+import fnmatch
+import os
+from pathlib import Path
+import re
+import subprocess
+import sys
+
+MAX_BYTES = 25 * 1024 * 1024
+WARN_BYTES = 10 * 1024 * 1024
+
+HARD_BLOCKED_REMOTES = ("aims-git.rz-berlin.mpg.de",)
+HARD_BLOCKED_PATH_PREFIXES = (
+    "/home/adam/work/FHI-aims/FHIaims_genericELPA_modded",
+    "/home/adam/work/FHI-aims/FHIaims_rs_soc_export_review",
+    "/home/adam/work/FHI-aims/FHI-aims_rs_soc_hamiltonian_modifications",
+    "/home/adam/work/FHI-aims/FHI-aims_rs_soc_hamiltonian_modifications_obselete",
+    "/home/adam/work/FHI-aims/fhiaims_real_space_hamiltonian_development",
+    "/home/lacoxson/software/FHIaims",
+    "/home/lacoxson/software/FHIaims_modded",
+    "/home/adam/adamworkstation",
+    "/home/adam/work/multi_task_dzindo",
+    "/home/adam/work/ML_Hamiltonians_paper",
+)
+
+FORBIDDEN_GLOBS = (
+    "*.h5",
+    "*.hdf5",
+    "*.scfout",
+    "*.cube",
+    "*.rst",
+    "*.chs",
+    "*.wfc*",
+    "realspace_soc_matrix*",
+    "rs_soc_matrix*",
+    "*.pt",
+    "*.pth",
+    "*.ckpt",
+    "*.safetensors",
+    "*.pkl",
+    "*.chk",
+    "*.fchk",
+    "*.tar",
+    "*.tar.gz",
+    "*.tgz",
+    "*.tar.zst",
+    "*.zip",
+    ".env",
+    "*id_rsa*",
+    "*id_ed25519*",
+    "*.pem",
+)
+
+SECRET_PATTERNS = (
+    ("GitHub classic token", re.compile(r"ghp_[A-Za-z0-9]{25,}")),
+    ("GitHub fine-grained PAT", re.compile(r"github_pat_[A-Za-z0-9_]{25,}")),
+    ("OpenAI/API secret key", re.compile(r"sk-(?:proj-)?[A-Za-z0-9_-]{25,}")),
+    ("Google API key", re.compile(r"AIza[0-9A-Za-z_-]{35}")),
+    ("Private SSH/TLS key block", re.compile(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----")),
+)
+
+
+def git_out(*args: str, binary: bool = False) -> bytes | str:
+    res = subprocess.run(["git", *args], capture_output=True, check=False)
+    if res.returncode != 0:
+        return b"" if binary else ""
+    return res.stdout if binary else res.stdout.decode("utf-8", errors="replace")
+
+
+def main() -> int:
+    repo_root = str(Path(git_out("rev-parse", "--show-toplevel").strip() or os.getcwd()).resolve())
+    errors: list[str] = []
+    warnings: list[str] = []
+
+    # 1. Path & Remote check
+    for blocked in HARD_BLOCKED_PATH_PREFIXES:
+        if repo_root == blocked or repo_root.startswith(blocked + "/"):
+            errors.append(f"Repository path '{repo_root}' is on the hard blocklist ('{blocked}').")
+
+    remotes = git_out("remote", "-v")
+    for b_rem in HARD_BLOCKED_REMOTES:
+        if b_rem in remotes:
+            errors.append(f"Repository remote references blocked host '{b_rem}'.")
+
+    # 2. Staged files check
+    raw_staged = git_out("diff", "--cached", "--name-only", "-z", "--diff-filter=ACM", binary=True)
+    assert isinstance(raw_staged, bytes)
+    staged_files = [p.decode("utf-8", errors="surrogateescape") for p in raw_staged.split(b"\x00") if p]
+
+    for rel_path in staged_files:
+        basename = os.path.basename(rel_path)
+
+        # Glob check
+        for pat in FORBIDDEN_GLOBS:
+            if fnmatch.fnmatch(basename, pat) or fnmatch.fnmatch(rel_path, pat):
+                errors.append(f"Forbidden file pattern '{pat}' matched staged file: {rel_path}")
+                break
+
+        # Exact staged Git index blob size check
+        sz_str = git_out("cat-file", "-s", f":0:{rel_path}").strip()
+        if sz_str.isdigit():
+            sz = int(sz_str)
+            if sz >= MAX_BYTES:
+                errors.append(
+                    f"File exceeds 25 MB cap ({sz / (1024 * 1024):.2f} MB): {rel_path}"
+                )
+            elif sz >= WARN_BYTES:
+                warnings.append(
+                    f"Large staged file ({sz / (1024 * 1024):.2f} MB, <25 MB cap): {rel_path}"
+                )
+
+        # Proprietary FHI-aims Fortran source check
+        if basename.lower().endswith((".f90", ".f", ".f77", ".fh")):
+            blob = git_out("show", f":0:{rel_path}")
+            if isinstance(blob, str) and ("FHI-aims" in blob or "Fritz-Haber-Institut" in blob):
+                errors.append(
+                    f"Proprietary FHI-aims Fortran source detected in staged file: {rel_path}"
+                )
+
+    # 3. Secret scan across added lines in staged diff
+    diff_text = git_out("diff", "--cached", "--unified=0", "--no-color")
+    assert isinstance(diff_text, str)
+    current_file = "<unknown>"
+    for line in diff_text.splitlines():
+        if line.startswith("+++ b/"):
+            current_file = line[6:]
+            continue
+        if line.startswith("+") and not line.startswith("+++"):
+            added = line[1:]
+            for label, regex in SECRET_PATTERNS:
+                if regex.search(added):
+                    errors.append(f"Potential {label} detected in staged additions of '{current_file}'.")
+
+    for w in warnings:
+        print(f"[pre-commit WARNING] {w}", file=sys.stderr)
+
+    if errors:
+        print("\n[pre-commit BLOCKED] Commit aborted due to guardrail violation(s):", file=sys.stderr)
+        for e in errors:
+            print(f"  - {e}", file=sys.stderr)
+        print(
+            "\nKeep scientific binaries/checkpoints >=25 MB out of Git (use jhworkstation / institutional storage),\n"
+            "and never stage credentials or proprietary FHI-aims sources.",
+            file=sys.stderr,
+        )
+        return 1
+
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

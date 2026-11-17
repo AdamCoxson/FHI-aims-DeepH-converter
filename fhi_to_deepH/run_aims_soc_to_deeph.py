@@ -1,10 +1,11 @@
 """Convert one plain FHI-aims SOC calculation using the bundled legacy parser.
 
-Usage: python run_aims_soc_to_deeph.py AIMS_DIRECTORY NEW_OUTPUT_DIRECTORY
+Usage: python run_aims_soc_to_deeph.py AIMS_DIRECTORY OUTPUT_DIRECTORY
 Requires NumPy, h5py, ASE and DeepH-dock (deepx_dock). The historical parser
 applies its legacy periodic same-orbital sign correction once. Use this route
 for compatible legacy raw exports, including the source revision in this kit.
 Input files are staged because the existing parser may repair basis indices.
+Existing generated output files are overwritten; unrelated files are kept.
 """
 
 import argparse
@@ -22,13 +23,13 @@ def parse_soc_hamiltonian(aims_directory, output_directory, tolerance=1e-3):
     destination = Path(output_directory).resolve()
     if not source.is_dir():
         raise NotADirectoryError(source)
-    if destination.exists():
-        raise FileExistsError(f"Choose a new output directory: {destination}")
+    if destination.exists() and not destination.is_dir():
+        raise NotADirectoryError(destination)
     if not math.isfinite(tolerance) or tolerance <= 0:
         raise ValueError("tolerance must be finite and positive")
     names = ("control.in", "geometry.in", "aims.out", "basis-indices.out",
              "rs_indices.out", "rs_hamiltonian.out", "rs_overlap.out",
-             "realspace_soc_matrix.out")
+             "rs_soc_matrix.out")
     for name in names:
         if not (source / name).is_file():
             raise FileNotFoundError(source / name)
@@ -44,9 +45,9 @@ def parse_soc_hamiltonian(aims_directory, output_directory, tolerance=1e-3):
             raise RuntimeError(f"FHI-aims parser returned status {result}")
         if not reader.spin_orbit or reader.spinful or reader.aims_data_type != "plain":
             raise ValueError("This runner requires a nonmagnetic, plain-output SOC calculation")
-        # Reserve the destination only after parsing succeeds; never delete an
-        # existing directory. dump_data() accepts this newly created directory.
-        destination.mkdir(parents=True, exist_ok=False)
+        # Create the destination after parsing succeeds. dump_data() overwrites
+        # generated files within it and leaves unrelated files alone.
+        destination.mkdir(parents=True, exist_ok=True)
         reader.dump_data()
         return len(reader.atom_pairs)
 
