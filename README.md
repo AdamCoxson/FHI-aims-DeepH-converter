@@ -271,6 +271,10 @@ parsing, the exported HDF5 files, or agreement with FHI-aims eigenvalues.
 | Atom, basis or matrix size mismatch | Check that all files came from the same calculation and are complete. |
 | `Hermitian check failed` | Check input consistency and the legacy SOC convention before changing the tolerance. |
 
+## External Test Data & Datasets
+
+Raw FHI-aims real-space matrix exports and converted DeepH `.h5` datasets are not committed to Git. See [DATA_LOCATIONS.md](DATA_LOCATIONS.md) for local/workstation dataset paths and future online archive links.
+
 ## License
 
 [MIT](LICENSE).

@@ -15,9 +15,9 @@ import shutil
 import tempfile
 
 
-def parse_soc_hamiltonian(aims_directory, output_directory, tolerance=1e-3):
+def parse_soc_hamiltonian(aims_directory, output_directory, tolerance=1e-3, legacy_soc_sign="auto"):
     """Write spinor/scalar H, overlap and metadata without modifying raw inputs."""
-    from aims_soc_to_deeph import FHIAimsReader
+    from aims_soc_to_deeph import FHIAimsReader, _find_soc_matrix_file
 
     source = Path(aims_directory).resolve(strict=True)
     destination = Path(output_directory).resolve()
@@ -27,19 +27,20 @@ def parse_soc_hamiltonian(aims_directory, output_directory, tolerance=1e-3):
         raise NotADirectoryError(destination)
     if not math.isfinite(tolerance) or tolerance <= 0:
         raise ValueError("tolerance must be finite and positive")
-    names = ("control.in", "geometry.in", "aims.out", "basis-indices.out",
-             "rs_indices.out", "rs_hamiltonian.out", "rs_overlap.out",
-             "rs_soc_matrix.out")
+    names = ["control.in", "geometry.in", "aims.out", "basis-indices.out",
+             "rs_indices.out", "rs_hamiltonian.out", "rs_overlap.out"]
     for name in names:
         if not (source / name).is_file():
             raise FileNotFoundError(source / name)
+    soc_file, _ = _find_soc_matrix_file(source)
+    names.append(soc_file.name)
 
     with tempfile.TemporaryDirectory(prefix="aims_soc_conversion_") as scratch:
         stage = Path(scratch)
         for name in names:
             shutil.copy2(source / name, stage / name)
         reader = FHIAimsReader(stage, destination, export_H=True, export_H0=True,
-                              tolerance=tolerance)
+                              tolerance=tolerance, legacy_soc_sign=legacy_soc_sign)
         result = reader.analysis_data()
         if result != 0:
             raise RuntimeError(f"FHI-aims parser returned status {result}")
@@ -58,8 +59,19 @@ def main():
     parser.add_argument("output_directory", type=Path)
     parser.add_argument("--tolerance", type=float, default=1e-3,
                         help="Existing parser's consistency tolerance in eV (default: 1e-3)")
+    parser.add_argument(
+        "--legacy-soc-sign",
+        choices=("auto", "true", "false"),
+        default="auto",
+        help="Handle legacy (260530) same-sign R!=0 diagonal SOC bug: auto (default), true, or false",
+    )
     args = parser.parse_args()
-    blocks = parse_soc_hamiltonian(args.aims_directory, args.output_directory, args.tolerance)
+    blocks = parse_soc_hamiltonian(
+        args.aims_directory,
+        args.output_directory,
+        args.tolerance,
+        legacy_soc_sign=args.legacy_soc_sign,
+    )
     print(f"Converted {blocks} atom-pair blocks to {args.output_directory.resolve()}")
 
 

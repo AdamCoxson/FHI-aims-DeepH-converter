@@ -5,6 +5,7 @@ import collections
 from pathlib import Path
 from ase.io import read
 import re
+import struct
 
 from functools import partial
 
@@ -105,6 +106,12 @@ FILES_MX_IDX_NOSYMM = "rs_indices_nosymm.out"
 FILES_NECESSARY = set([AIMS_CONTROL_FILENAME, AIMS_STRUCT_FILENAME, AIMS_BASIS_FILENAME, FILES_MX_IDX])
 FILES_LOG = 'aims.out'
 FILES_IN = ["rs_overlap.out", "rs_hamiltonian.out"]
+FILES_IN_SOC_CANDIDATES = (
+    ("rs_soc_matrix.bin", True),
+    ("realspace_soc_matrix_unfmttd.out", True),
+    ("rs_soc_matrix.out", False),
+    ("realspace_soc_matrix.out", False),
+)
 FILES_IN_SOC = "rs_soc_matrix.out"
 FILES_IN_H0 = "rs_hamiltonian0.out"
 FILES_IN_SPIN = ["rs_overlap.out", "rs_hamiltonian_up.out", "rs_hamiltonian_dn.out"]  # not support spin orbit coupling yet
@@ -519,27 +526,209 @@ def _read_ham0(aims_dir_path: Path, n_ham_size: int, spinful: bool):
         ham0_values = _read_mx_val(ham0_path, n_ham_size) * HARTREE_TO_EV
         return ham0_values
 
-def _read_soc_matrices(aims_dir_path: Path, n_ham_size: int):
-    soc_path = Path(aims_dir_path) / FILES_IN_SOC
-    with open(soc_path, 'r') as f:
+def _find_soc_matrix_file(aims_dir_path: Path) -> tuple[Path, bool]:
+    """Locate the SOC matrix file, preferring binary over plain text."""
+    base = Path(aims_dir_path)
+    for filename, is_binary in FILES_IN_SOC_CANDIDATES:
+        candidate = base / filename
+        if candidate.is_file():
+            return candidate, is_binary
+    searched = ", ".join(name for name, _ in FILES_IN_SOC_CANDIDATES)
+    raise FileNotFoundError(
+        f"No real-space SOC matrix file found in {base} (searched: {searched})"
+    )
+
+
+def _read_soc_binary_raw(soc_path: Path, n_ham_size: int) -> np.ndarray:
+    """Read Fortran sequential unformatted SOC matrix in Hartree.
+
+    Auto-detects 4-byte vs 8-byte record markers and Int32 vs Int64 header ints.
+    """
+    file_size = soc_path.stat().st_size
+    size_mismatch_ld = None
+
+    for marker_bytes in (4, 8):
+        marker_fmt = "<Q" if marker_bytes == 8 else "<I"
+        for int_bytes in (4, 8):
+            int_fmt = "<q" if int_bytes == 8 else "<i"
+            min_size = 3 * 2 * marker_bytes + 2 * int_bytes
+            if file_size < min_size:
+                continue
+            with open(soc_path, "rb") as f:
+                m1 = struct.unpack(marker_fmt, f.read(marker_bytes))[0]
+                if m1 != int_bytes:
+                    continue
+                ld = struct.unpack(int_fmt, f.read(int_bytes))[0]
+                m1_end = struct.unpack(marker_fmt, f.read(marker_bytes))[0]
+                if m1_end != m1 or ld <= 0:
+                    continue
+
+                m2 = struct.unpack(marker_fmt, f.read(marker_bytes))[0]
+                if m2 != int_bytes:
+                    continue
+                ncols = struct.unpack(int_fmt, f.read(int_bytes))[0]
+                m2_end = struct.unpack(marker_fmt, f.read(marker_bytes))[0]
+                if m2_end != m2 or ncols != 3:
+                    continue
+
+                expected_payload_bytes = ld * 3 * 8
+                m3 = struct.unpack(marker_fmt, f.read(marker_bytes))[0]
+                if m3 != expected_payload_bytes:
+                    continue
+                if f.tell() + expected_payload_bytes + marker_bytes != file_size:
+                    continue
+
+                if ld not in (n_ham_size, n_ham_size + 1):
+                    size_mismatch_ld = ld
+                    continue
+
+                arr = np.fromfile(f, dtype="<f8", count=ld * 3)
+                m3_end_raw = f.read(marker_bytes)
+                if len(m3_end_raw) != marker_bytes:
+                    continue
+                m3_end = struct.unpack(marker_fmt, m3_end_raw)[0]
+                if m3_end != m3 or arr.size != ld * 3:
+                    continue
+                soc_data = arr.reshape((ld, 3), order="F")
+                if soc_data.shape[0] == n_ham_size + 1:
+                    soc_data = soc_data[:-1, :]
+                return soc_data
+
+    if size_mismatch_ld is not None:
+        raise AssertionError(
+            f"SOC matrix size match error: expected {n_ham_size}, got {size_mismatch_ld}"
+        )
+    raise ValueError(
+        f"Failed to parse binary Fortran unformatted SOC matrix {soc_path} "
+        f"(file_size={file_size}, expected n_ham_size={n_ham_size})"
+    )
+
+
+def _read_soc_plain_raw(soc_path: Path, n_ham_size: int) -> np.ndarray:
+    """Read plain-text SOC matrix in Hartree."""
+    with open(soc_path, "r") as f:
         lines = f.readlines()
-    if len(lines[0].split()) == 2:
+    if lines and len(lines[0].split()) == 2:
         lines = lines[1:]  # Skip header (n_ham_size, 3)
-    
-    # Save a temporary file to use _fix_loadtxt safely or just parse it directly
+
     data = []
     for line in lines:
         tokens = line.split()
-        if not tokens: continue
+        if not tokens:
+            continue
         data.append([float(x) for x in tokens])
-    soc_data = np.array(data, dtype=np.float64) * HARTREE_TO_EV
-    
+    soc_data = np.array(data, dtype=np.float64)
+
     if soc_data.shape[0] == n_ham_size + 1:
         soc_data = soc_data[:-1, :]
     else:
-        assert soc_data.shape[0] == n_ham_size, f"SOC matrix size match error: expected {n_ham_size}, got {soc_data.shape[0]}"
-        
+        assert soc_data.shape[0] == n_ham_size, (
+            f"SOC matrix size match error: expected {n_ham_size}, got {soc_data.shape[0]}"
+        )
+    return soc_data
+
+
+def _read_soc_matrices(aims_dir_path: Path, n_ham_size: int):
+    soc_path, is_binary = _find_soc_matrix_file(aims_dir_path)
+    if is_binary:
+        soc_data_ha = _read_soc_binary_raw(soc_path, n_ham_size)
+    else:
+        soc_data_ha = _read_soc_plain_raw(soc_path, n_ham_size)
+    soc_data = soc_data_ha * HARTREE_TO_EV
     return soc_data[:, 0], soc_data[:, 1], soc_data[:, 2]
+
+
+def _is_canonical_positive_R(nR) -> bool:
+    for comp in nR:
+        if comp > 0:
+            return True
+        if comp < 0:
+            return False
+    return False
+
+
+def _normalize_legacy_soc_sign(mode: str | bool) -> str:
+    if isinstance(mode, bool):
+        return "true" if mode else "false"
+    normalized = str(mode).strip().lower()
+    if normalized not in ("auto", "true", "false"):
+        raise ValueError(f"legacy_soc_sign must be 'auto', 'true', or 'false', got {mode!r}")
+    return normalized
+
+
+def _detect_legacy_soc_sign(
+    start_idx_matrix: np.ndarray,
+    end_idx_matrix: np.ndarray,
+    col_idx: np.ndarray,
+    cell_indices: np.ndarray,
+    soc_components_ev: tuple[np.ndarray, np.ndarray, np.ndarray],
+    n_cells: int,
+    n_basis: int,
+    threshold_ha: float = 1e-10,
+) -> bool:
+    """Detect whether R != 0, ib == jb SOC entries carry the legacy same-sign bug.
+
+    Inspects canonical (+R, ib, ib) vs (-R, ib, ib) pairs with |val| > threshold_ha.
+    Returns True if all significant pairs are same-sign (legacy 260530 bug),
+    False if all are opposite-sign (FHIaims_Nov26) or none exceed threshold.
+    Raises ValueError if mixed same-sign and opposite-sign pairs are found.
+    """
+    threshold_ev = threshold_ha * HARTREE_TO_EV
+    cell_map = {
+        (int(cell_indices[r, 0]), int(cell_indices[r, 1]), int(cell_indices[r, 2])): r
+        for r in range(n_cells)
+    }
+
+    same_sign_count = 0
+    opp_sign_count = 0
+
+    for idx_R in range(n_cells):
+        nR = (
+            int(cell_indices[idx_R, 0]),
+            int(cell_indices[idx_R, 1]),
+            int(cell_indices[idx_R, 2]),
+        )
+        if not any(nR) or not _is_canonical_positive_R(nR):
+            continue
+        idx_neg_R = cell_map.get((-nR[0], -nR[1], -nR[2]))
+        if idx_neg_R is None:
+            continue
+
+        for ib in range(n_basis):
+            s_pos = int(start_idx_matrix[idx_R, ib])
+            e_pos = int(end_idx_matrix[idx_R, ib])
+            if s_pos < 0 or e_pos <= s_pos:
+                continue
+            s_neg = int(start_idx_matrix[idx_neg_R, ib])
+            e_neg = int(end_idx_matrix[idx_neg_R, ib])
+            if s_neg < 0 or e_neg <= s_neg:
+                continue
+
+            pos_matches = np.where(col_idx[s_pos:e_pos] == ib)[0]
+            if pos_matches.size == 0:
+                continue
+            neg_matches = np.where(col_idx[s_neg:e_neg] == ib)[0]
+            if neg_matches.size == 0:
+                continue
+
+            idx_pos = s_pos + int(pos_matches[0])
+            idx_neg = s_neg + int(neg_matches[0])
+
+            for comp_arr in soc_components_ev:
+                v_pos = float(comp_arr[idx_pos])
+                v_neg = float(comp_arr[idx_neg])
+                if abs(v_pos) > threshold_ev and abs(v_neg) > threshold_ev:
+                    if v_pos * v_neg > 0.0:
+                        same_sign_count += 1
+                    elif v_pos * v_neg < 0.0:
+                        opp_sign_count += 1
+
+    if same_sign_count > 0 and opp_sign_count > 0:
+        raise ValueError(
+            f"Mixed same-sign (n={same_sign_count}) and opposite-sign (n={opp_sign_count}) "
+            f"R!=0, ib==jb SOC entries above {threshold_ha} Ha; cannot auto-detect SOC sign convention."
+        )
+    return same_sign_count > 0
 
 def _parse_whether_electric_response(aims_dir_path: Path) -> bool:
     # if have FILES_IN_ELECTRIC_RESPONSE
@@ -638,7 +827,7 @@ def _read_fermi(aims_dir_path: Path):
 
 def _trans_mxs_to_R_dict(start_idx_matrix:np.ndarray, end_idx_matrix:np.ndarray, col_idx:np.ndarray, 
                           cell_indices:np.ndarray, orbit_quantity_list: list[int], phase_factor: np.ndarray,
-                          mxs: list[np.ndarray], n_cells:int, n_basis:int, sub_idx:np.ndarray, symm:bool = True, symm_signs: list[int] = None, tolerance: float = 1e-3):
+                          mxs: list[np.ndarray], n_cells:int, n_basis:int, sub_idx:np.ndarray, symm:bool = True, symm_signs: list[int] = None, tolerance: float = 1e-3, apply_legacy_soc_sign: bool = True):
     '''
     deeph data structure ref:
         atom_pairs: (n_atom_pairs, 5), int
@@ -682,18 +871,11 @@ def _trans_mxs_to_R_dict(start_idx_matrix:np.ndarray, end_idx_matrix:np.ndarray,
                 for mx_idx in range(num_mx):
                     single_val = mxs[mx_idx][idx_in_val] * phase_factor[idx_i_basis] * phase_factor[idx_j_basis]
                     
-                    # Fix for FHI-aims Category A diagonal symmetry bug
+                    # Fix for FHI-aims Category A diagonal symmetry bug (legacy 260530 builds only)
                     # If this is a SOC matrix (symm_signs == -1), and it's a diagonal element
-                    # (same orbital) with R != 0, enforce antisymmetry consistently.
-                    if any(nR) and (idx_i_basis == idx_j_basis) and (symm_signs is not None) and (symm_signs[mx_idx] == -1):
-                        is_positive_R = False
-                        for comp in nR:
-                            if comp > 0:
-                                is_positive_R = True
-                                break
-                            elif comp < 0:
-                                break
-                        if not is_positive_R:
+                    # (same orbital) with R != 0, enforce antisymmetry consistently when requested.
+                    if apply_legacy_soc_sign and any(nR) and (idx_i_basis == idx_j_basis) and (symm_signs is not None) and (symm_signs[mx_idx] == -1):
+                        if not _is_canonical_positive_R(nR):
                             single_val = -single_val
 
                     mx_R[R_key][mx_idx][idx_row_sub, idx_col_sub] = single_val
@@ -736,10 +918,10 @@ def _trans_R_dict_to_entries(mx_R: dict[tuple, list[np.ndarray]], num_mx: int):
 
 def _trans_mxs_to_entries(start_idx_matrix:np.ndarray, end_idx_matrix:np.ndarray, col_idx:np.ndarray, 
                           cell_indices:np.ndarray, orbit_quantity_list: list[int], phase_factor: np.ndarray,
-                          mxs: list[np.ndarray], n_cells:int, n_basis:int, sub_idx:np.ndarray, symm:bool = True, symm_signs: list[int] = None, tolerance: float = 1e-3):
+                          mxs: list[np.ndarray], n_cells:int, n_basis:int, sub_idx:np.ndarray, symm:bool = True, symm_signs: list[int] = None, tolerance: float = 1e-3, apply_legacy_soc_sign: bool = True):
     
     num_mx, mx_R = _trans_mxs_to_R_dict(start_idx_matrix, end_idx_matrix, col_idx, cell_indices, orbit_quantity_list, 
-                                        phase_factor, mxs, n_cells, n_basis, sub_idx, symm=symm, symm_signs=symm_signs, tolerance=tolerance)
+                                        phase_factor, mxs, n_cells, n_basis, sub_idx, symm=symm, symm_signs=symm_signs, tolerance=tolerance, apply_legacy_soc_sign=apply_legacy_soc_sign)
 
     atom_pairs, chunk_boundaries, chunk_shapes, entries = _trans_R_dict_to_entries(mx_R, num_mx)
 
@@ -770,7 +952,7 @@ class PeriodicAimsDataTranslator:
         export_H=True, export_H0=False,
         export_rho=False, export_r=False,
         minus_H0 = False, tolerance: float = 1e-3,
-        n_jobs=-1, n_tier=0
+        n_jobs=-1, n_tier=0, legacy_soc_sign: str | bool = "auto"
     ):
         self.aims_data_dir = Path(aims_data_dir)
         self.deeph_data_dir = Path(deeph_data_dir)
@@ -782,6 +964,7 @@ class PeriodicAimsDataTranslator:
         self.tolerance = tolerance
         self.n_jobs = n_jobs
         self.n_tier = n_tier
+        self.legacy_soc_sign = _normalize_legacy_soc_sign(legacy_soc_sign)
         self.deeph_data_dir.mkdir(parents=True, exist_ok=True)
 
 
@@ -789,12 +972,13 @@ class PeriodicAimsDataTranslator:
     @staticmethod
     def transfer_one_aims_to_deeph(dir_name: str, aims_path: Path, deeph_path: Path,
                                   export_H = True,  export_H0 = False,
-                                  export_rho=False, export_r=False, minus_H0=False, tolerance: float = 1e-3):
+                                  export_rho=False, export_r=False, minus_H0=False, tolerance: float = 1e-3,
+                                  legacy_soc_sign: str | bool = "auto"):
         aims_dir_path = aims_path / dir_name
         if not aims_dir_path.is_dir():
             return
         deeph_dir_path = deeph_path / dir_name
-        reader = FHIAimsReader(aims_dir_path, deeph_dir_path, export_H, export_H0, export_rho, export_r, tolerance)
+        reader = FHIAimsReader(aims_dir_path, deeph_dir_path, export_H, export_H0, export_rho, export_r, tolerance, legacy_soc_sign=legacy_soc_sign)
         ierr = reader.analysis_data(minus_H0=minus_H0)
         reader.dump_data()
         return ierr
@@ -802,13 +986,16 @@ class PeriodicAimsDataTranslator:
 class FHIAimsReader:
     def __init__(self, aims_path: str | Path, deeph_path: str | Path,
                 export_H = True,  export_H0 = False, 
-                export_rho=False, export_r=False, tolerance: float = 1e-3):
+                export_rho=False, export_r=False, tolerance: float = 1e-3,
+                legacy_soc_sign: str | bool = "auto"):
         self.aims_path = Path(aims_path)
         self.deeph_path = Path(deeph_path)
         self.mx_lst:list[np.ndarray] = []  # list of sparse matrix
         self.export_H = export_H; self.export_H0 = export_H0
         self.export_rho = export_rho; self.export_r = export_r
         self.tolerance = tolerance
+        self.legacy_soc_sign = _normalize_legacy_soc_sign(legacy_soc_sign)
+        self.detected_legacy_soc_sign: bool | None = None
 
     def analysis_data(self, minus_H0=False):
         # ------------ calculation parameters from control.in ------------
@@ -879,13 +1066,28 @@ class FHIAimsReader:
             raise ValueError(f"Unsupported aims_data_type: {self.aims_data_type}!")
         # ------------ transform to deeph data structure ------------
         symm_signs = None
+        apply_legacy_soc_sign = False
         if self.spin_orbit:
             # -MODIFIED signs to -1 for Pauli matrices to enforce antisymmetry
             symm_signs = [1, 1, -1, -1, -1]
+            if self.export_H:
+                if self.legacy_soc_sign == "auto":
+                    apply_legacy_soc_sign = _detect_legacy_soc_sign(
+                        self.start_idx_matrix,
+                        self.end_idx_matrix,
+                        self.col_idx,
+                        self.cell_indices,
+                        (self.mx_lst[2], self.mx_lst[3], self.mx_lst[4]),
+                        self.n_cells,
+                        self.n_basis,
+                    )
+                else:
+                    apply_legacy_soc_sign = (self.legacy_soc_sign == "true")
+                self.detected_legacy_soc_sign = apply_legacy_soc_sign
             
         self.atom_pairs, self.chunk_boundaries, self.chunk_shapes, self.entries_lst = _trans_mxs_to_entries(
             self.start_idx_matrix, self.end_idx_matrix, self.col_idx, self.cell_indices,
-            self.orbit_quantity_list, self.phase_factor, self.mx_lst, self.n_cells, self.n_basis, self.sub_idx, symm_signs=symm_signs, tolerance=self.tolerance
+            self.orbit_quantity_list, self.phase_factor, self.mx_lst, self.n_cells, self.n_basis, self.sub_idx, symm_signs=symm_signs, tolerance=self.tolerance, apply_legacy_soc_sign=apply_legacy_soc_sign
         )
         if self.export_H0:
             _, _, _, self.ham0_entries_lst = _trans_mxs_to_entries(
